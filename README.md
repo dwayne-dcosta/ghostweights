@@ -1,5 +1,7 @@
 # GhostWeights 👻⚖️
 
+[![GhostWeights CI](https://github.com/dwayne-dcosta/ghostweights/actions/workflows/go.yml/badge.svg)](https://github.com/dwayne-dcosta/ghostweights/actions/workflows/go.yml)
+
 **Ephemeral Edge LLM Optimizer & Zero-Copy Virtual Block Storage Daemon**
 
 GhostWeights eliminates NVMe SSD storage bloat for local edge LLMs (GGUF / Safetensors) on macOS and Linux. Instead of extracting multi-gigabyte model files to disk or relying on slow `.zip` archives, GhostWeights slices model weights into block-indexed `.gw` archives, mounts them virtually in volatile RAM on demand, and executes an automated **Ghost Wipe** the moment your inference process terminates.
