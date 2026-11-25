@@ -8,15 +8,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
-// TestGhostWeightsEndToEnd verifies packing, inspecting, HTTP Range streaming (ReadAt),
-// and automatic volatile Ghost Wipe cleanup upon client process termination.
 func TestGhostWeightsEndToEnd(t *testing.T) {
 	tmpDir := t.TempDir()
-	binaryPath := filepath.Join(tmpDir, "ghostweights")
+	binName := "ghostweights"
+	if runtime.GOOS == "windows" {
+		binName = "ghostweights.exe"
+	}
+	binaryPath := filepath.Join(tmpDir, binName)
 
 	// 1. Build the Go CLI binary from ../cli
 	buildCmd := exec.Command("go", "build", "-o", binaryPath, "../cli")
@@ -57,12 +60,11 @@ func TestGhostWeightsEndToEnd(t *testing.T) {
 	}
 
 	// 5. Test `ghostweights run` with a wrapped bash script that fetches a specific byte range
-	// crossing a 4MB block boundary (bytes 4,194,000 to 4,195,000) and records the mount directory
-	fetchedBytesPath := filepath.Join(tmpDir, "fetched_slice.bin")
-	mountDirRecordPath := filepath.Join(tmpDir, "mount_dir.txt")
+	fetchedBytesPath := filepath.ToSlash(filepath.Join(tmpDir, "fetched_slice.bin"))
+	mountDirRecordPath := filepath.ToSlash(filepath.Join(tmpDir, "mount_dir.txt"))
 
 	script := fmt.Sprintf(`
-		echo -n "$GHOSTWEIGHTS_MOUNT" > %q
+		printf '%%s' "$GHOSTWEIGHTS_MOUNT" > %q
 		curl -s -H "Range: bytes=4194000-4194999" "$GHOSTWEIGHTS_URL" -o %q
 	`, mountDirRecordPath, fetchedBytesPath)
 
@@ -72,7 +74,6 @@ func TestGhostWeightsEndToEnd(t *testing.T) {
 		t.Fatalf("run command failed: %v\nOutput: %s", err, string(runOut))
 	}
 
-	// Verify Ghost Wipe message fired
 	if !strings.Contains(string(runOut), "NVMe SSD footprint restored to zero bytes") {
 		t.Errorf("expected Ghost Wipe confirmation in output, got:\n%s", string(runOut))
 	}
@@ -87,7 +88,7 @@ func TestGhostWeightsEndToEnd(t *testing.T) {
 		t.Errorf("streamed byte slice mismatch! Got %d bytes, expected %d bytes", len(fetchedSlice), len(expectedSlice))
 	}
 
-	// 7. Verify the ephemeral mount directory in /tmp was completely destroyed (zero footprint)
+	// 7. Verify the ephemeral mount directory was completely destroyed (zero footprint)
 	mountDirBytes, err := os.ReadFile(mountDirRecordPath)
 	if err != nil {
 		t.Fatalf("failed reading recorded mount dir: %v", err)
