@@ -4,7 +4,7 @@
 
 **Zero-Footprint Ephemeral Runtime & Lossless Tensor Compressor for Edge & Containerized LLMs**
 
-GhostWeights eliminates NVMe SSD storage bloat and container cold-start duplication for local and containerized LLMs (`.safetensors` & `.gguf`). It slices weights into 4MB indexed blocks (`GW02`), applies lossless **BF16/FP16 Byte-Plane Splitting** (separating exponent and mantissa byte planes before compression), mounts models virtually in volatile RAM on demand, and executes an automated **Ghost Wipe** on exit.
+GhostWeights eliminates NVMe SSD storage bloat and container cold-start duplication for local and containerized LLMs across **macOS, Linux, and Windows** (`.safetensors` & `.gguf`). It slices weights into 4MB indexed blocks (`GW02`), applies lossless **BF16/FP16 Byte-Plane Splitting** (separating exponent and mantissa byte planes before compression), mounts models virtually in volatile RAM on demand, and executes an automated **Ghost Wipe** on exit.
 
 ```text
                   [ Compressed Model File (.gw) ]
