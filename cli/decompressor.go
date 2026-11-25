@@ -11,14 +11,13 @@ import (
 	"sync"
 )
 
-const MaxCachedBlocks = 16 // Keeps up to 64MB (16 * 4MB) of active tensor blocks in volatile RAM
+const MaxCachedBlocks = 16
 
 type cacheEntry struct {
 	blockIdx uint32
 	data     []byte
 }
 
-// GhostReader provides zero-extraction, random-access reads over a packed .gw file
 type GhostReader struct {
 	file         *os.File
 	OriginalSize uint64
@@ -32,7 +31,6 @@ type GhostReader struct {
 	diskReads uint64
 }
 
-// OpenGhostModel reads the GW01 header and offset table into RAM without unpacking payload blocks
 func OpenGhostModel(gwPath string) (*GhostReader, error) {
 	f, err := os.Open(gwPath)
 	if err != nil {
@@ -63,6 +61,7 @@ func OpenGhostModel(gwPath string) (*GhostReader, error) {
 		binary.Read(f, binary.LittleEndian, &indices[i].CompressedOffset)
 		binary.Read(f, binary.LittleEndian, &indices[i].CompressedSize)
 		binary.Read(f, binary.LittleEndian, &indices[i].UncompressedSize)
+		binary.Read(f, binary.LittleEndian, &indices[i].Flags)
 	}
 
 	return &GhostReader{
@@ -75,7 +74,6 @@ func OpenGhostModel(gwPath string) (*GhostReader, error) {
 	}, nil
 }
 
-// getBlock fetches a single 4MB decompressed block from volatile LRU cache or decompresses it on-the-fly
 func (gr *GhostReader) getBlock(blockIdx uint32) ([]byte, error) {
 	gr.mu.Lock()
 	if elem, ok := gr.cache[blockIdx]; ok {
@@ -109,6 +107,10 @@ func (gr *GhostReader) getBlock(blockIdx uint32) ([]byte, error) {
 		return nil, fmt.Errorf("zlib decompress error on block %d: %w", blockIdx, err)
 	}
 
+	if idx.Flags == FlagBytePlane {
+		uncompData = unsplitBytePlanes(uncompData)
+	}
+
 	gr.mu.Lock()
 	defer gr.mu.Unlock()
 
@@ -131,7 +133,6 @@ func (gr *GhostReader) getBlock(blockIdx uint32) ([]byte, error) {
 	return uncompData, nil
 }
 
-// ReadAt implements io.ReaderAt so virtual mounts and mmap proxies can read arbitrary byte ranges
 func (gr *GhostReader) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("negative offset: %d", off)
@@ -168,7 +169,6 @@ func (gr *GhostReader) ReadAt(p []byte, off int64) (int, error) {
 	return totalRead, nil
 }
 
-// WipeMemory zeroes out all cached tensor blocks in volatile RAM and closes the file handle
 func (gr *GhostReader) WipeMemory() error {
 	gr.mu.Lock()
 	defer gr.mu.Unlock()
@@ -176,7 +176,7 @@ func (gr *GhostReader) WipeMemory() error {
 	for k, elem := range gr.cache {
 		entry := elem.Value.(*cacheEntry)
 		for i := range entry.data {
-			entry.data[i] = 0 // Explicitly overwrite volatile RAM bytes
+			entry.data[i] = 0
 		}
 		delete(gr.cache, k)
 	}

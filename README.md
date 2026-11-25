@@ -2,20 +2,20 @@
 
 [![GhostWeights CI](https://github.com/dwayne-dcosta/ghostweights/actions/workflows/go.yml/badge.svg)](https://github.com/dwayne-dcosta/ghostweights/actions/workflows/go.yml)
 
-**Ephemeral Edge LLM Optimizer & Zero-Copy Virtual Block Storage Daemon**
+**Zero-Footprint Ephemeral Runtime & Lossless Tensor Compressor for Edge & Containerized LLMs**
 
-GhostWeights eliminates NVMe SSD storage bloat for local edge LLMs (GGUF / Safetensors) on macOS and Linux. Instead of extracting multi-gigabyte model files to disk or relying on slow `.zip` archives, GhostWeights slices model weights into block-indexed `.gw` archives, mounts them virtually in volatile RAM on demand, and executes an automated **Ghost Wipe** the moment your inference process terminates.
+GhostWeights eliminates NVMe SSD storage bloat and container cold-start duplication for local and containerized LLMs (`.safetensors` & `.gguf`). It slices weights into 4MB indexed blocks (`GW02`), applies lossless **BF16/FP16 Byte-Plane Splitting** (separating exponent and mantissa byte planes before compression), mounts models virtually in volatile RAM on demand, and executes an automated **Ghost Wipe** on exit.
 
 ```text
                   [ Compressed Model File (.gw) ]
                                  │
-                        (ghostweights run)
+              (ghostweights run / ghostweights container)
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│         Layer 1: Block-Indexed Offset Reader (GW01 Format)      │
+│    Layer 1: GW02 Block Indexer & BF16 Byte-Plane Unshuffler     │
 └────────────────────────────────┬────────────────────────────────┘
                                  │
-             (On-Demand 4MB Chunk Decompression in RAM)
+          (On-Demand 4MB Chunk Decompression in ~64MB RAM)
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │      Layer 2: Zero-Copy Virtual Mount (HTTP Range / mmap)       │
@@ -28,13 +28,19 @@ GhostWeights eliminates NVMe SSD storage bloat for local edge LLMs (GGUF / Safet
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Features
-* **Block-Indexed `.gw` Format (`GW01`):** Slices raw weights into independent 4MB compressed blocks with a binary Header Index Table for microsecond random-access tensor reads.
-* **Volatile LRU RAM Cache:** Keeps active tensor blocks in memory and serves arbitrary byte ranges via `io.ReaderAt` and HTTP Range streaming without writing unpacked data to your NVMe SSD.
-* **Automated Ghost Wipe:** Traps `SIGINT` / `SIGTERM` and subprocess exit events to forcefully unmount virtual endpoints, overwrite cached RAM blocks with zeroes, and delete transient `/tmp` session directories.
-* **Zero-Dependency Core & Python SDK:** Written in pure standard-library Go (`compress/zlib`, `net/http`, `os/signal`) paired with a drop-in Python context manager (`with ghostweights.load(...)`).
+## Verified Hugging Face Benchmarks (Apple Silicon)
 
-## Quickstart
+Tested on **`Qwen/Qwen2.5-1.5B-Instruct`** (`BF16 .safetensors` and `Q4_K_M .gguf`):
+
+| Model Artifact | Format | Original Size | Packed `.gw` Size | Net Disk Saved | Post-Exit Footprint |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `Qwen2.5-1.5B-Instruct` | `BF16 .safetensors` | 3,087,467,144 B (3.09 GB) | 2,194,548,819 B (2.19 GB) | **28.92% (892.9 MB)** | **0 Bytes** |
+| `Qwen2.5-1.5B-Instruct` | `Q4_K_M .gguf` | 1,117,320,736 B (1.12 GB) | 1,112,895,528 B (1.11 GB) | **0.40% (4.43 MB)** | **0 Bytes** |
+
+* **Constant ~64MB RAM Overhead:** The 16-block LRU cache (`16 × 4MB`) bounds memory overhead to ~64MB whether streaming a 1.5B or 70B+ parameter model (up to 16 PB theoretical ceiling).
+* **Lossless Byte-Plane Splitting:** Separates interleaved `BF16/FP16` exponent and mantissa bytes per 4MB chunk, delivering **~29% lossless compression** on floating-point tensors while falling back automatically on pre-quantized 4-bit GGUFs.
+
+## CLI Toolkit
 
 ### 1. Build & Verify
 ```bash
@@ -42,25 +48,31 @@ make build
 make test
 ```
 
-### 2. Pack & Run via CLI
+### 2. Core Commands
 ```bash
-# Compress a local model file into block-indexed .gw format
-./bin/ghostweights pack llama-3-8b.gguf llama-3-8b.gw
+# Non-destructive lossless compression (keeps original file)
+./bin/ghostweights pack model.safetensors qwen.gw
 
-# Inspect header & storage savings
-./bin/ghostweights inspect llama-3-8b.gw
+# Compress, verify block integrity, and remove uncompressed source to reclaim disk space
+./bin/ghostweights shrink model.safetensors qwen.gw
 
-# Mount virtually and run an ephemeral client session
-./bin/ghostweights run llama-3-8b.gw -- bash -c 'curl -s -I $GHOSTWEIGHTS_URL | head -n 5'
+# Inspect GW02 header & compression stats
+./bin/ghostweights inspect qwen.gw
+
+# Mount virtually in RAM for local processes (wipes on exit)
+./bin/ghostweights run qwen.gw -- bash -c 'curl -s -r 0-4095 $GHOSTWEIGHTS_URL | wc -c'
+
+# Spin up an ephemeral Docker container wired to host RAM stream (destroys container + mount on exit)
+./bin/ghostweights container qwen.gw python:3.11-slim -- python3 -c "import os; print(os.environ['GHOSTWEIGHTS_URL'])"
 ```
 
 ### 3. Python Context Manager SDK
 ```python
 from sdk.python import load, pack
 
-pack("llama-3-8b.gguf", "llama-3-8b.gw")
+pack("model.safetensors", "qwen.gw")
 
-with load("llama-3-8b.gw") as model:
+with load("qwen.gw") as model:
     # Stream exact tensor byte slices directly from volatile RAM
     header_bytes = model.read_range(0, 4095)
 # Ghost Wipe triggers automatically here

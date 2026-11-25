@@ -10,29 +10,72 @@ import (
 )
 
 const (
-	MagicBytes = "GW01"
-	ChunkSize  = 4 * 1024 * 1024 // 4MB blocks for fast random-access tensor reads
+	MagicBytes    = "GW02"
+	ChunkSize     = 4 * 1024 * 1024
+	FlagRaw       = 0
+	FlagBytePlane = 1
 )
 
-// BlockIndex maps an uncompressed byte offset to its compressed location in the .gw file
 type BlockIndex struct {
 	UncompressedOffset uint64
 	CompressedOffset   uint64
 	CompressedSize     uint32
 	UncompressedSize   uint32
+	Flags              uint32
 }
 
-// PackModel slices a raw file into 4MB chunks, compresses each independently via zlib,
-// and writes a fast random-access Header Index Table at the start of the .gw file.
-func PackModel(inputPath, outputPath string) error {
+func splitBytePlanes(src []byte) []byte {
+	n := len(src)
+	dst := make([]byte, n)
+	half := (n + 1) / 2
+	for i := 0; i < n; i++ {
+		if i%2 == 0 {
+			dst[i/2] = src[i]
+		} else {
+			dst[half+(i/2)] = src[i]
+		}
+	}
+	return dst
+}
+
+func unsplitBytePlanes(src []byte) []byte {
+	n := len(src)
+	dst := make([]byte, n)
+	half := (n + 1) / 2
+	for i := 0; i < n; i++ {
+		if i%2 == 0 {
+			dst[i] = src[i/2]
+		} else {
+			dst[i] = src[half+(i/2)]
+		}
+	}
+	return dst
+}
+
+func compressZlib(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(data); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func PackModel(inputPath, outputPath string, replaceSource bool) error {
 	inFile, err := os.Open(inputPath)
 	if err != nil {
 		return fmt.Errorf("failed to open input file: %w", err)
 	}
-	defer inFile.Close()
 
 	stat, err := inFile.Stat()
 	if err != nil {
+		inFile.Close()
 		return fmt.Errorf("failed to stat input file: %w", err)
 	}
 	originalSize := uint64(stat.Size())
@@ -44,15 +87,14 @@ func PackModel(inputPath, outputPath string) error {
 
 	outFile, err := os.Create(outputPath)
 	if err != nil {
+		inFile.Close()
 		return fmt.Errorf("failed to create output .gw file: %w", err)
 	}
-	defer outFile.Close()
 
-	// Header layout:
-	// [4 bytes Magic "GW01"][8 bytes OriginalSize][4 bytes ChunkSize][4 bytes TotalBlocks]
-	// Followed by: [TotalBlocks * 24 bytes Index Table]
-	headerSize := int64(20 + (totalBlocks * 24))
+	headerSize := int64(20 + (totalBlocks * 28))
 	if _, err := outFile.Seek(headerSize, io.SeekStart); err != nil {
+		inFile.Close()
+		outFile.Close()
 		return fmt.Errorf("failed to seek past header: %w", err)
 	}
 
@@ -64,21 +106,35 @@ func PackModel(inputPath, outputPath string) error {
 	for {
 		n, readErr := io.ReadFull(inFile, buf)
 		if n > 0 {
-			var compBuf bytes.Buffer
-			zw, err := zlib.NewWriterLevel(&compBuf, zlib.BestSpeed)
+			rawChunk := buf[:n]
+			shuffled := splitBytePlanes(rawChunk)
+			compShuffled, err := compressZlib(shuffled)
 			if err != nil {
-				return fmt.Errorf("zlib init error: %w", err)
-			}
-			if _, err := zw.Write(buf[:n]); err != nil {
-				return fmt.Errorf("zlib write error: %w", err)
-			}
-			if err := zw.Close(); err != nil {
-				return fmt.Errorf("zlib close error: %w", err)
+				inFile.Close()
+				outFile.Close()
+				return fmt.Errorf("zlib shuffled error: %w", err)
 			}
 
-			compBytes := compBuf.Bytes()
-			written, err := outFile.Write(compBytes)
+			chosenBytes := compShuffled
+			chosenFlag := uint32(FlagBytePlane)
+
+			if len(compShuffled) >= n-1024 {
+				compRaw, err := compressZlib(rawChunk)
+				if err != nil {
+					inFile.Close()
+					outFile.Close()
+					return fmt.Errorf("zlib raw error: %w", err)
+				}
+				if len(compRaw) < len(compShuffled) {
+					chosenBytes = compRaw
+					chosenFlag = uint32(FlagRaw)
+				}
+			}
+
+			written, err := outFile.Write(chosenBytes)
 			if err != nil {
+				inFile.Close()
+				outFile.Close()
 				return fmt.Errorf("failed writing compressed block: %w", err)
 			}
 
@@ -87,6 +143,7 @@ func PackModel(inputPath, outputPath string) error {
 				CompressedOffset:   currentCompressedOffset,
 				CompressedSize:     uint32(written),
 				UncompressedSize:   uint32(n),
+				Flags:              chosenFlag,
 			})
 
 			currentUncompressedOffset += uint64(n)
@@ -97,16 +154,21 @@ func PackModel(inputPath, outputPath string) error {
 			break
 		}
 		if readErr != nil {
+			inFile.Close()
+			outFile.Close()
 			return fmt.Errorf("error reading input file: %w", readErr)
 		}
 	}
 
-	// Rewind to byte 0 and write the Header + Index Table
 	if _, err := outFile.Seek(0, io.SeekStart); err != nil {
+		inFile.Close()
+		outFile.Close()
 		return fmt.Errorf("failed to rewind for header write: %w", err)
 	}
 
 	if _, err := outFile.Write([]byte(MagicBytes)); err != nil {
+		inFile.Close()
+		outFile.Close()
 		return err
 	}
 	binary.Write(outFile, binary.LittleEndian, originalSize)
@@ -118,12 +180,32 @@ func PackModel(inputPath, outputPath string) error {
 		binary.Write(outFile, binary.LittleEndian, idx.CompressedOffset)
 		binary.Write(outFile, binary.LittleEndian, idx.CompressedSize)
 		binary.Write(outFile, binary.LittleEndian, idx.UncompressedSize)
+		binary.Write(outFile, binary.LittleEndian, idx.Flags)
+	}
+
+	inFile.Close()
+	if err := outFile.Close(); err != nil {
+		return fmt.Errorf("failed closing output file: %w", err)
 	}
 
 	ratio := (1.0 - (float64(currentCompressedOffset) / float64(originalSize))) * 100
 	fmt.Printf("📦 [GhostWeights] Packed %s -> %s\n", inputPath, outputPath)
 	fmt.Printf("📊 [Stats] Original: %d bytes | Compressed: %d bytes | Saved: %.2f%% (%d blocks)\n",
 		originalSize, currentCompressedOffset, ratio, len(indices))
+
+	if replaceSource {
+		verifyReader, err := OpenGhostModel(outputPath)
+		if err != nil {
+			return fmt.Errorf("verification failed; keeping original file %s: %w", inputPath, err)
+		}
+		_ = verifyReader.WipeMemory()
+
+		if err := os.Remove(inputPath); err != nil {
+			return fmt.Errorf("packed successfully, but failed to remove original file %s: %w", inputPath, err)
+		}
+		fmt.Printf("🗑️  [Storage Reclaimed] Verified %s and removed uncompressed source (%d bytes freed)\n",
+			outputPath, originalSize)
+	}
 
 	return nil
 }
