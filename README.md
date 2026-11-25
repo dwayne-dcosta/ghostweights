@@ -77,3 +77,13 @@ with load("qwen.gw") as model:
     header_bytes = model.read_range(0, 4095)
 # Ghost Wipe triggers automatically here
 ```
+
+## Cross-Platform Support
+
+GhostWeights compiles natively with zero external dependencies and is verified via GitHub Actions CI across all three major operating systems:
+
+| Operating System | Architecture | Virtual Mount Adapter | Pre-Compiled Release Binary |
+| :--- | :--- | :--- | :--- |
+| **macOS** | Apple Silicon (`arm64`) & Intel (`amd64`) | `cli/mount_darwin.go` | `ghostweights-darwin-arm64` / `amd64` |
+| **Linux** | `amd64` & `arm64` | `cli/mount_linux.go` (`/dev/shm`) | `ghostweights-linux-amd64` / `arm64` |
+| **Windows** | `amd64` | `cli/mount_windows.go` | `ghostweights-windows-amd64.exe` |
