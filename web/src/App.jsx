@@ -22,9 +22,7 @@ export default function App() {
       <header className="sticky top-0 z-50 border-b border-slate-800/80 bg-[#05080f]/80 backdrop-blur-md">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-cyan-500/40 bg-cyan-500/10 text-cyan-400">
-              <Cpu className="h-5 w-5" />
-            </div>
+            <img src="/ghostweights.png" alt="GhostWeights Logo" className="h-9 w-9 shrink-0 rounded-lg object-cover shadow-[0_0_15px_rgba(34,211,238,0.25)]" />
             <span className="text-lg font-bold tracking-tight text-white">
               Ghost<span className="text-cyan-400">Weights</span>
             </span>
