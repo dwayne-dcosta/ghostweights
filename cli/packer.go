@@ -7,15 +7,17 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 )
 
 const (
 	MagicBytes    = "GW02"
-	ChunkSize     = 4 * 1024 * 1024
+	ChunkSize     = 4 * 1024 * 1024 // 4MB blocks for fast random-access tensor reads
 	FlagRaw       = 0
 	FlagBytePlane = 1
 )
 
+// BlockIndex maps an uncompressed byte offset to its compressed location in the .gw file
 type BlockIndex struct {
 	UncompressedOffset uint64
 	CompressedOffset   uint64
@@ -24,6 +26,8 @@ type BlockIndex struct {
 	Flags              uint32
 }
 
+// splitBytePlanes separates interleaved 16-bit BF16/FP16 bytes [E0, M0, E1, M1...]
+// into contiguous planes [E0, E1... | M0, M1...] so zlib compresses repetitive exponent bytes ~30% smaller.
 func splitBytePlanes(src []byte) []byte {
 	n := len(src)
 	dst := make([]byte, n)
@@ -38,6 +42,7 @@ func splitBytePlanes(src []byte) []byte {
 	return dst
 }
 
+// unsplitBytePlanes restores contiguous planes [E0, E1... | M0, M1...] back to original [E0, M0, E1, M1...].
 func unsplitBytePlanes(src []byte) []byte {
 	n := len(src)
 	dst := make([]byte, n)
@@ -67,6 +72,8 @@ func compressZlib(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// PackModel slices a raw file into 4MB chunks, tests BF16 byte-plane splitting vs raw compression per block,
+// writes to a crash-safe .tmp staging file, verifies GW02 integrity, and atomically renames to outputPath.
 func PackModel(inputPath, outputPath string, replaceSource bool) error {
 	inFile, err := os.Open(inputPath)
 	if err != nil {
@@ -85,16 +92,22 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 		totalBlocks = 1
 	}
 
-	outFile, err := os.Create(outputPath)
+	tmpPath := outputPath + ".tmp"
+	outFile, err := os.Create(tmpPath)
 	if err != nil {
 		inFile.Close()
-		return fmt.Errorf("failed to create output .gw file: %w", err)
+		return fmt.Errorf("failed to create staging .tmp file: %w", err)
+	}
+
+	cleanupTmp := func() {
+		_ = outFile.Close()
+		_ = os.Remove(tmpPath)
 	}
 
 	headerSize := int64(20 + (totalBlocks * 28))
 	if _, err := outFile.Seek(headerSize, io.SeekStart); err != nil {
 		inFile.Close()
-		outFile.Close()
+		cleanupTmp()
 		return fmt.Errorf("failed to seek past header: %w", err)
 	}
 
@@ -111,7 +124,7 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 			compShuffled, err := compressZlib(shuffled)
 			if err != nil {
 				inFile.Close()
-				outFile.Close()
+				cleanupTmp()
 				return fmt.Errorf("zlib shuffled error: %w", err)
 			}
 
@@ -122,7 +135,7 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 				compRaw, err := compressZlib(rawChunk)
 				if err != nil {
 					inFile.Close()
-					outFile.Close()
+					cleanupTmp()
 					return fmt.Errorf("zlib raw error: %w", err)
 				}
 				if len(compRaw) < len(compShuffled) {
@@ -134,7 +147,7 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 			written, err := outFile.Write(chosenBytes)
 			if err != nil {
 				inFile.Close()
-				outFile.Close()
+				cleanupTmp()
 				return fmt.Errorf("failed writing compressed block: %w", err)
 			}
 
@@ -155,20 +168,20 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 		}
 		if readErr != nil {
 			inFile.Close()
-			outFile.Close()
+			cleanupTmp()
 			return fmt.Errorf("error reading input file: %w", readErr)
 		}
 	}
 
 	if _, err := outFile.Seek(0, io.SeekStart); err != nil {
 		inFile.Close()
-		outFile.Close()
+		cleanupTmp()
 		return fmt.Errorf("failed to rewind for header write: %w", err)
 	}
 
 	if _, err := outFile.Write([]byte(MagicBytes)); err != nil {
 		inFile.Close()
-		outFile.Close()
+		cleanupTmp()
 		return err
 	}
 	binary.Write(outFile, binary.LittleEndian, originalSize)
@@ -185,7 +198,30 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 
 	inFile.Close()
 	if err := outFile.Close(); err != nil {
-		return fmt.Errorf("failed closing output file: %w", err)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed closing staging file: %w", err)
+	}
+
+	// Verify GW02 integrity on the staging file BEFORE touching inputPath or outputPath
+	verifyReader, err := OpenGhostModel(tmpPath)
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("verification failed; keeping original file %s intact: %w", inputPath, err)
+	}
+	_ = verifyReader.WipeMemory()
+
+	absIn, _ := filepath.Abs(inputPath)
+	absOut, _ := filepath.Abs(outputPath)
+
+	if replaceSource && absIn != absOut {
+		if err := os.Remove(inputPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("verified archive, but failed to remove original file %s: %w", inputPath, err)
+		}
+	}
+
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		return fmt.Errorf("failed atomic rename %s -> %s: %w", tmpPath, outputPath, err)
 	}
 
 	ratio := (1.0 - (float64(currentCompressedOffset) / float64(originalSize))) * 100
@@ -194,17 +230,7 @@ func PackModel(inputPath, outputPath string, replaceSource bool) error {
 		originalSize, currentCompressedOffset, ratio, len(indices))
 
 	if replaceSource {
-		verifyReader, err := OpenGhostModel(outputPath)
-		if err != nil {
-			return fmt.Errorf("verification failed; keeping original file %s: %w", inputPath, err)
-		}
-		_ = verifyReader.WipeMemory()
-
-		if err := os.Remove(inputPath); err != nil {
-			return fmt.Errorf("packed successfully, but failed to remove original file %s: %w", inputPath, err)
-		}
-		fmt.Printf("🗑️  [Storage Reclaimed] Verified %s and removed uncompressed source (%d bytes freed)\n",
-			outputPath, originalSize)
+		fmt.Printf("🗑️  [Storage Reclaimed] Verified & atomically replaced source (%d bytes freed)\n", originalSize)
 	}
 
 	return nil
